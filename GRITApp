@@ -1,0 +1,361 @@
+library(shiny)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+
+players_data <- read_csv("player-match-ratings-3-cleaned.csv")
+
+get_score_col <- function(position2) {
+  pos_map <- list(
+    WM = "WM.score",
+    CB = "CB.score",
+    CDM = "CMD.score",
+    CMA = "CMA.score",
+    ST = "ST.score",
+    FB = "FB.score",
+    GK = "GK.score"
+  )
+  pos_map[[position2]]
+}
+
+# Determine win/loss
+determine_result <- function(row) {
+  if(is.na(row$home_score) || is.na(row$away_score)) return(NA)
+  is_home <- row$team_name == row$home_team.home_team_name
+  player_score <- if(is_home) row$home_score else row$away_score
+  opponent_score <- if(is_home) row$away_score else row$home_score
+  if(player_score > opponent_score) return("Win")
+  if(player_score < opponent_score) return("Loss")
+  return("Draw")
+}
+
+get_color <- function(pct) {
+  if(is.na(pct)) return("grey")
+  if(pct < 50) {
+    colorRampPalette(c("red", "white"))(100)[max(1, round(pct * 2))]
+  } else {
+    colorRampPalette(c("white", "green"))(100)[max(1, round((pct - 50) * 2))]
+  }
+}
+
+safe_str <- function(x) ifelse(is.na(x) || x == "", "N/A", x)
+
+
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      .app-container {border:4px solid #004A97; padding:15px; border-radius:8px; margin:15px;}
+      .header-row {display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;}
+      .header-title {font-size:28px; font-weight:bold; color:#004A97; margin:0;}
+      .logo-img {height:60px; width:auto;}
+    "))
+  ),
+  div(class = "app-container",
+      div(class = "header-row",
+          h1("Oldham GRIT/Mentality Profile", class = "header-title"),
+          img(src = "OldhamLogo.png", class = "logo-img", alt = "Oldham Logo")
+      ),
+      sidebarLayout(
+        sidebarPanel(
+          selectizeInput("player_select", "Select Player:",
+                         choices = unique(players_data$player_name),
+                         selected = unique(players_data$player_name)[1],
+                         options = list(placeholder = 'Type to search players...', maxOptions = 100)),
+          uiOutput("profile_box"),
+          uiOutput("average_box"),
+          uiOutput("percentile_box"),
+          uiOutput("big_game_box"),
+          uiOutput("resilience_box"),
+          uiOutput("player_ai_writeup")
+        ),
+        mainPanel(
+          plotlyOutput("consistency_plot"),
+          hr(),
+          plotOutput("big_game_plot"),
+          hr(),
+          plotlyOutput("resilience_plot")
+        )
+      )
+  )
+)
+
+# --- Server ---
+server <- function(input, output, session) {
+  
+
+  player_data <- reactive({
+    req(input$player_select)
+    pdata <- players_data %>% filter(player_name == input$player_select) %>% arrange(match_date)
+    if(nrow(pdata) == 0) return(NULL)
+    pdata
+  })
+  
+  # Player position
+  player_position <- reactive({
+    pdata <- player_data()
+    if(is.null(pdata)) return(NULL)
+    unique(pdata$position2)[1]
+  })
+  
+  # Score column
+  score_col <- reactive({
+    pos <- player_position()
+    get_score_col(pos)
+  })
+  
+  # Top 5 big games
+  top5_big_games <- reactive({
+    pdata <- player_data()
+    sc_col <- score_col()
+    if(is.null(pdata) || is.null(sc_col)) return(NULL)
+    pdata <- pdata %>%
+      rowwise() %>%
+      mutate(opponent_elo = ifelse(team_name == home_team.home_team_name, elorating2, elorating1),
+             result = determine_result(cur_data())) %>%
+      ungroup() %>%
+      arrange(desc(opponent_elo)) %>%
+      slice_head(n = 5)
+    pdata
+  })
+  
+  # Resilience games (after a loss)
+  resilience_games <- reactive({
+    pdata <- player_data()
+    sc_col <- score_col()
+    if(is.null(pdata) || is.null(sc_col)) return(NULL)
+    pdata <- pdata %>%
+      rowwise() %>%
+      mutate(result = determine_result(cur_data())) %>%
+      ungroup()
+    loss_idx <- which(pdata$result=="Loss")
+    after_loss <- loss_idx + 1
+    after_loss <- after_loss[after_loss <= nrow(pdata)]
+    pdata[after_loss, ]
+  })
+  
+  # Consistency score
+  consistency_score <- reactive({
+    pdata <- player_data()
+    sc_col <- score_col()
+    if(is.null(pdata) || is.null(sc_col)) return(NA_real_)
+    scores <- pdata[[sc_col]] %>% na.omit()
+    if(length(scores)<2) return(NA_real_)
+    1 / sd(scores)
+  })
+  
+  # Percentile rank for consistency
+  percentile_rank <- reactive({
+    sc_col <- score_col()
+    pos <- player_position()
+    if(is.null(sc_col) || is.null(pos)) return(NA_real_)
+    consistency_all <- players_data %>%
+      filter(position2 == pos) %>%
+      group_by(player_name) %>%
+      summarize(score_sd = sd(get(sc_col), na.rm=TRUE), .groups="drop") %>%
+      mutate(consistency = ifelse(score_sd>0, 1/score_sd, NA)) %>%
+      filter(!is.na(consistency))
+    cs <- consistency_score()
+    if(is.na(cs)) return(NA_real_)
+    ecdf(consistency_all$consistency)(cs) * 100
+  })
+  
+  # Average score
+  average_score <- reactive({
+    pdata <- player_data()
+    sc_col <- score_col()
+    if(is.null(pdata) || is.null(sc_col)) return(NA_real_)
+    scores <- pdata[[sc_col]] %>% na.omit()
+    if(length(scores)<1) return(NA_real_)
+    mean(scores)
+  })
+  
+  # Average percentile
+  average_percentile_rank <- reactive({
+    sc_col <- score_col()
+    pos <- player_position()
+    if(is.null(sc_col) || is.null(pos)) return(NA_real_)
+    avg_all <- players_data %>%
+      filter(position2 == pos) %>%
+      group_by(player_name) %>%
+      summarize(avg_score = mean(get(sc_col), na.rm=TRUE), .groups="drop") %>%
+      filter(!is.na(avg_score))
+    avg_score_val <- average_score()
+    if(is.na(avg_score_val)) return(NA_real_)
+    ecdf(avg_all$avg_score)(avg_score_val) * 100
+  })
+  
+  # Utility for percentile boxes
+  render_box <- function(value_pct, label) {
+    color <- get_color(value_pct)
+    box_content <- ifelse(is.na(value_pct), "N/A", paste0(round(value_pct,1), "%"))
+    div(style=paste0("padding:10px; margin-top:10px; background-color:", color,
+                     "; border:1px solid black; border-radius:5px; font-weight:bold; text-align:center;"),
+        paste(label, box_content))
+  }
+  
+  # Profile box 
+  output$profile_box <- renderUI({
+    pdata <- player_data()
+    if(is.null(pdata)) return(NULL)
+    prof <- tail(pdata, 1)  
+    age_val <- floor(prof$age)
+    div(style="padding:15px; margin-top:10px; border:1px solid #ccc; border-radius:5px; background:#f9f9f9;",
+        tags$h4("Player Profile"),
+        tags$p(strong("Age: "), safe_str(age_val)),
+        tags$p(strong("Height: "), safe_str(prof$player_height)),
+        tags$p(strong("Weight: "), safe_str(prof$player_weight)),
+        tags$p(strong("Team: "), safe_str(prof$team_name)),
+        tags$p(strong("Position: "), safe_str(prof$position2))
+    )
+  })
+  
+  # Percentile & average boxes
+  output$percentile_box <- renderUI({ render_box(percentile_rank(), "Consistency Percentile Rank: ") })
+  output$average_box <- renderUI({ render_box(average_percentile_rank(), "Average Rating Percentile Rank: ") })
+  
+  # --- Big Game Percentile Rank ---
+  output$big_game_box <- renderUI({
+    top5 <- top5_big_games()
+    sc_col <- score_col()
+    if(is.null(top5) || nrow(top5)==0 || is.null(sc_col)) 
+      return(render_box(NA, "Big Game Player Percentile Rank: "))
+    
+    top_avg <- mean(top5[[sc_col]], na.rm=TRUE)
+    overall_avg <- average_score()
+    pct_change <- if(is.na(top_avg) || is.na(overall_avg) || overall_avg==0) NA else (top_avg - overall_avg) / overall_avg * 100
+    
+    pos <- player_position()
+    all_players <- players_data %>% 
+      filter(position2 == pos) %>%
+      group_by(player_name) %>%
+      summarize(player_avg = mean(get(sc_col), na.rm=TRUE), .groups="drop") %>%
+      mutate(pct_vs_avg = (player_avg - mean(player_avg, na.rm=TRUE)) / mean(player_avg, na.rm=TRUE) * 100)
+    
+    pct_rank <- if(!is.na(pct_change)) ecdf(all_players$pct_vs_avg)(pct_change) * 100 else NA
+    render_box(pct_rank, "Big Game Player Percentile Rank: ")
+  })
+  
+  # Resilience percentile box
+  output$resilience_box <- renderUI({
+    res_games <- resilience_games()
+    sc_col <- score_col()
+    if(is.null(res_games) || nrow(res_games)==0 || is.null(sc_col)) return(render_box(NA, "Resilience Percentile Rank: "))
+    avg <- mean(res_games[[sc_col]], na.rm=TRUE)
+    render_box(avg, "Resilience Percentile Rank: ")
+  })
+  
+  # --- Plots ---
+  output$consistency_plot <- renderPlotly({
+    pdata <- player_data()
+    sc_col <- score_col()
+    if(is.null(pdata) || is.null(sc_col) || nrow(pdata)<1) {
+      p <- ggplot() + annotate("text", x=1, y=1, label="No data to display", size=6) + theme_void()
+      return(ggplotly(p))
+    }
+    pdata <- pdata %>% rowwise() %>% mutate(result = determine_result(cur_data())) %>% ungroup()
+    p <- ggplot(pdata, aes(x=match_date, y=.data[[sc_col]], group=1,
+                           text=paste0("Date: ", match_date,
+                                       "<br>Rating: ", round(.data[[sc_col]],2),
+                                       "<br>Score: ", home_score, "-", away_score,
+                                       "<br>Result: ", result))) +
+      geom_line(color="blue") + geom_point(color="blue") +
+      labs(title="Consistency Over Time", x="Match Date", y="Match Rating") +
+      theme_minimal()
+    ggplotly(p, tooltip="text")
+  })
+  
+  output$big_game_plot <- renderPlot({
+    top5 <- top5_big_games()
+    sc_col <- score_col()
+    if(is.null(top5) || nrow(top5)<1 || is.null(sc_col)) {
+      plot.new()
+      text(0.5,0.5,"No data to display")
+      return()
+    }
+    avg_line <- average_score()
+    top5$match_label <- paste0(top5$match_date,"\n(", top5$home_score,"-",top5$away_score,")")
+    ggplot(top5, aes(x=match_label, y=.data[[sc_col]], fill=result)) +
+      geom_col(width=0.7) +
+      scale_fill_manual(values=c("Win"="green","Draw"="grey","Loss"="red")) +
+      geom_hline(yintercept=avg_line, linetype="dotted", color="black") +
+      labs(title="Top 5 Opponent Elo Matches - Ratings", x="Match (Date & Score)", y="Match Rating") +
+      theme_minimal() + theme(axis.text.x=element_text(angle=45,hjust=1))
+  })
+  
+  # --- Resilience Plot (labels only in hover) ---
+  output$resilience_plot <- renderPlotly({
+    res_games <- resilience_games()
+    sc_col <- score_col()
+    if(is.null(res_games) || nrow(res_games)<1 || is.null(sc_col)) {
+      p <- ggplot() + annotate("text", x=1, y=1, label="No data to display", size=6) + theme_void()
+      return(ggplotly(p))
+    }
+    avg_line <- mean(res_games[[sc_col]], na.rm=TRUE)
+    res_games$match_label <- paste0(res_games$match_date,"\n(", res_games$home_score,"-",res_games$away_score,")")
+    p <- ggplot(res_games, aes(x=match_label, y=.data[[sc_col]], fill=result,
+                               text=paste0("Match: ", match_label,
+                                           "<br>Rating: ", round(.data[[sc_col]],2),
+                                           "<br>Result: ", result))) +
+      geom_col(width=0.7) +
+      scale_fill_manual(values=c("Win"="green","Draw"="grey","Loss"="red")) +
+      geom_hline(yintercept=avg_line, linetype="dotted", color="black") +
+      labs(title="Performance After a Loss (Resilience)", x=NULL, y="Match Rating") +
+      theme_minimal() +
+      theme(axis.text.x = element_blank(),
+            axis.ticks.x = element_blank())
+    ggplotly(p, tooltip="text")
+  })
+  
+  # --- AI Write-up---
+  output$player_ai_writeup <- renderUI({
+    pdata <- player_data()
+    if(is.null(pdata)) return(HTML("<p>No player data available</p>"))
+    prof <- tail(pdata, 1)
+    age_val <- floor(prof$age)
+    pos_val <- safe_str(prof$position2)
+    team_val <- safe_str(prof$team_name)
+    
+    avg <- average_score()
+    pct_avg <- average_percentile_rank()
+    consistency <- consistency_score()
+    pct_consistency <- percentile_rank()
+    
+    # Big game percentile 
+    top5 <- top5_big_games()
+    sc_col_val <- score_col()
+    big_game_pct <- if(!is.null(top5) && nrow(top5)>0) {
+      top_avg <- mean(top5[[sc_col_val]], na.rm=TRUE)
+      overall_avg <- avg
+      pct_change <- if(is.na(top_avg)||is.na(overall_avg)||overall_avg==0) NA else (top_avg-overall_avg)/overall_avg*100
+      
+      pos <- player_position()
+      all_players <- players_data %>% 
+        filter(position2 == pos) %>%
+        group_by(player_name) %>%
+        summarize(player_avg = mean(get(sc_col_val), na.rm=TRUE), .groups="drop") %>%
+        mutate(pct_vs_avg = (player_avg - mean(player_avg, na.rm=TRUE)) / mean(player_avg, na.rm=TRUE) * 100)
+      if(!is.na(pct_change)) ecdf(all_players$pct_vs_avg)(pct_change) * 100 else NA
+    } else NA
+    
+    res_games <- resilience_games()
+    res_avg <- if(!is.null(res_games) && nrow(res_games)>0) mean(res_games[[sc_col_val]], na.rm=TRUE) else NA
+    
+    lines <- c()
+    lines <- c(lines, paste0("<strong>", safe_str(prof$player_name), "</strong> is a ",
+                             if(!is.na(age_val)) paste0(age_val,"-year-old "), pos_val,
+                             " currently playing for ", team_val, "."))
+    if(!is.na(avg)) lines <- c(lines, paste0("Across all matches, the player's average rating is <strong>", round(avg,2),"</strong>, which places them in the <strong>", round(pct_avg,1),"%</strong> percentile among peers in the same position."))
+    if(!is.na(consistency)) lines <- c(lines, paste0("The player's consistency score is <strong>", round(consistency,2),"</strong>, indicating that their performance is reliable and falls in the <strong>", round(pct_consistency,1),"%</strong> percentile for consistency."))
+    if(!is.na(big_game_pct)) lines <- c(lines, paste0("In top 5 high-opponent Elo matches, the player performs in the <strong>", round(big_game_pct,1),"%</strong> percentile, showing their ability to excel in high-pressure games."))
+    if(!is.na(res_avg)) lines <- c(lines, paste0("After matches lost by their team, the player's average performance is <strong>", round(res_avg,2),"</strong>, reflecting their resilience and mental toughness."))
+    
+    HTML(paste0("<div style='padding:10px; background:#eef6ff; border:1px solid #aac; border-radius:6px;'>",
+                paste0(lines, collapse="<br>"), "</div>"))
+  })
+  
+}
+
+shinyApp(ui, server)
